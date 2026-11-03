@@ -295,6 +295,7 @@ let engineWorker = null;
 let cpuInstance = null;
 let engineModel = null;
 let engineLoading = null;
+let downloadAbort = null;
 let loaderHidden = false;
 
 function setModelState(state) {
@@ -351,15 +352,35 @@ async function ensureEngine(modelId) {
       const g = GGUF[modelId];
       const inst = await newWllama();
       cpuInstance = inst;
+      // Live download info: MB done, speed, and a warning if it stops moving.
+      const expected = g.mb * 1024 * 1024;
+      const dl = { loaded: 0, changed: Date.now(), t0: Date.now() };
+      downloadAbort = new AbortController();
+      const stallTimer = setInterval(() => {
+        if (cached) return;
+        const quiet = (Date.now() - dl.changed) / 1000;
+        if (quiet > 40) showLoader(title, `Download paused at ${fmtBytes(dl.loaded)} of about ${fmtBytes(expected)}. Check your internet — it continues when the connection is back. Or tap Cancel and try again.`, dl.loaded / expected);
+      }, 5000);
       // Direct file link (not the Hugging Face API) so a saved model also loads with no internet.
-      await inst.loadModelFromUrl(`https://huggingface.co/${g.repo}/resolve/main/${g.file}`, {
+      // Cancel must work at any stage, even before the first byte arrives.
+      const cancelled = new Promise((_, rej) => downloadAbort.signal.addEventListener("abort", () => rej(new Error("DOWNLOAD_CANCELLED"))));
+      cancelled.catch(() => {});
+      await Promise.race([cancelled, inst.loadModelFromUrl(`https://huggingface.co/${g.repo}/resolve/main/${g.file}`, {
         n_ctx: CTX_TOKENS,
         n_gpu_layers: 0, // processor only — never touch the graphics chip
-        progressCallback: ({ loaded, total }) => onProgress({
-          progress: total ? loaded / total : 0,
-          text: total ? `${fmtBytes(loaded)} of ${fmtBytes(total)}` : "",
-        }),
-      });
+        signal: downloadAbort.signal,
+        progressCallback: ({ loaded, total }) => {
+          const t = total || expected;
+          if (loaded !== dl.loaded) { dl.loaded = loaded; dl.changed = Date.now(); }
+          const secs = (Date.now() - dl.t0) / 1000;
+          const speed = secs > 2 && loaded ? ` · ${fmtBytes(loaded / secs)}/s` : "";
+          onProgress({
+            progress: Math.min(loaded / t, 0.99),
+            text: loaded >= t * 0.99 ? "Almost done, preparing the model…" : `${fmtBytes(loaded)} of ${fmtBytes(t)} downloaded${speed}`,
+          });
+        },
+      })]).finally(() => clearInterval(stallTimer));
+      downloadAbort = null;
       engine = makeCpuAdapter(inst);
     }
     engineKind = kind;
@@ -373,8 +394,11 @@ async function ensureEngine(modelId) {
     return await myLoad;
   } catch (e) {
     hideLoader();
+    const cancelled = downloadAbort?.signal.aborted;
+    downloadAbort = null;
     resetEngine(); // a failed load can leave the engine unusable, so always start fresh next time
     setModelState("off");
+    if (cancelled) throw new Error("DOWNLOAD_CANCELLED");
     const msg = String(e?.message || e);
     const networkish = /OFFLINE_NOT_CACHED|fetch|network/i.test(msg);
     if (kind === "gpu" && settings.engine !== "gpu" && cpuCapable(modelId) && !networkish) {
@@ -429,6 +453,7 @@ function resetEngine() {
 function explainError(e) {
   const msg = String(e?.message || e);
   if (isGpuLost(e)) return "The AI engine was interrupted. This happens when the phone locks, the app goes to the background, or memory runs low. Tap retry. If it keeps happening, switch to Shark Lite or Shark Nano in Models.";
+  if (msg === "DOWNLOAD_CANCELLED") return "Download cancelled. Tap retry to start it again.";
   if (/context size|exceed_context/i.test(msg)) return "This chat got too long for the model's memory. Start a new chat, or shorten your message.";
   if (msg === "NEEDS_GPU") return "This model needs a working graphics chip, which this device doesn't have. Use Shark Nano, Lite, Smart or Coder instead (open Models).";
   if (msg === "NO_WEBGPU") return "This browser can't run Shark AI's chat brain (it needs WebGPU). Use Chrome or Edge on Android/PC, or Safari on iPhone with iOS 26 or newer.";
@@ -1724,6 +1749,10 @@ async function init() {
   $("#replayGuideBtn").addEventListener("click", () => { $("#settingsDlg").close(); openWelcome(); });
   $("#welcomeDlg").addEventListener("cancel", (e) => { e.preventDefault(); });
   $("#loaderHide").addEventListener("click", () => { loaderHidden = true; $("#loader").classList.add("hidden"); });
+  $("#loaderCancel").addEventListener("click", () => {
+    if (downloadAbort) { downloadAbort.abort(); toast("Download cancelled."); }
+    else { loaderHidden = true; $("#loader").classList.add("hidden"); }
+  });
   document.querySelectorAll("dialog [data-close]").forEach((b) => b.addEventListener("click", () => b.closest("dialog").close()));
   document.querySelectorAll("dialog:not(#welcomeDlg)").forEach((d) => d.addEventListener("click", (e) => { if (e.target === d) d.close(); }));
 
