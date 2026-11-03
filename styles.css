@@ -351,3 +351,5 @@ a.mc-link:hover { text-decoration: underline; }
 
 /* Models that can't run with the current engine */
 .model-row.disabled { opacity: .55; }
+
+.loader-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
