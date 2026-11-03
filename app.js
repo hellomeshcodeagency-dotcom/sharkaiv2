@@ -239,15 +239,127 @@ async function cpuCacheList() {
     return await wlCache.cacheManager.list();
   } catch { return []; }
 }
+const ggufURL = (g) => `https://huggingface.co/${g.repo}/resolve/main/${g.file}`;
+
+/* ---- Resumable model download (saved piece by piece in the phone's private storage) ----
+   If the network drops, it waits and continues from the same byte. Progress survives app restarts. */
+const MODEL_DIR = "shark-models";
+const CHUNK_BYTES = (globalThis.__sharkChunkMB || 16) * 1024 * 1024;
+
+async function modelDir() {
+  const root = await navigator.storage.getDirectory();
+  return root.getDirectoryHandle(MODEL_DIR, { create: true });
+}
+async function readMeta(dir, file) {
+  try { return JSON.parse(await (await (await dir.getFileHandle(file + ".json")).getFile()).text()); } catch { return null; }
+}
+async function writeMeta(dir, file, meta) {
+  const w = await (await dir.getFileHandle(file + ".json", { create: true })).createWritable();
+  await w.write(JSON.stringify(meta));
+  await w.close();
+}
+async function localModelFile(id) {
+  const g = GGUF[id];
+  if (!g) return null;
+  try {
+    const dir = await modelDir();
+    const meta = await readMeta(dir, g.file);
+    if (!meta?.complete) return null;
+    const f = await (await dir.getFileHandle(g.file)).getFile();
+    return f.size === meta.size && f.size > 0 ? f : null;
+  } catch { return null; }
+}
+async function partialModelBytes(id) {
+  const g = GGUF[id];
+  try { return (await (await (await modelDir()).getFileHandle(g.file)).getFile()).size; } catch { return 0; }
+}
+
+function waitOrOnline(ms, signal) {
+  return new Promise((res) => {
+    const done = () => { clearTimeout(t); window.removeEventListener("online", done); signal?.removeEventListener("abort", done); res(); };
+    const t = setTimeout(done, ms);
+    window.addEventListener("online", done);
+    signal?.addEventListener("abort", done);
+  });
+}
+
+async function downloadModelFile(id, { signal, onProgress, onWaiting }) {
+  const g = GGUF[id];
+  const url = ggufURL(g);
+  const dir = await modelDir();
+  const fh = await dir.getFileHandle(g.file, { create: true });
+  let offset = (await fh.getFile()).size;
+  let total = (await readMeta(dir, g.file))?.total || 0;
+  let fails = 0;
+  for (;;) {
+    if (signal.aborted) throw new Error("DOWNLOAD_PAUSED");
+    if (total && offset >= total) break;
+    const start = offset;
+    const ctl = new AbortController();
+    const stop = () => ctl.abort();
+    signal.addEventListener("abort", stop);
+    let idle = null;
+    const kick = () => { clearTimeout(idle); idle = setTimeout(() => ctl.abort(), 30000); }; // no data for 30s → retry
+    let w = null;
+    try {
+      kick();
+      const res = await fetch(url, { headers: { Range: `bytes=${start}-${start + CHUNK_BYTES - 1}` }, signal: ctl.signal, cache: "no-store" });
+      if (res.status === 416) break; // nothing left → finished
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const m = (res.headers.get("Content-Range") || "").match(/\/(\d+)\s*$/);
+      if (m) total = +m[1];
+      const whole = res.status === 200; // server ignored the range and sent the whole file
+      if (whole) { offset = 0; total = +res.headers.get("Content-Length") || total; }
+      w = await fh.createWritable({ keepExistingData: !whole });
+      if (whole) await w.truncate(0); else await w.seek(offset);
+      const reader = res.body.getReader();
+      let got = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        kick();
+        await w.write(value);
+        got += value.length;
+        onProgress(offset + got, total);
+      }
+      await w.close();
+      w = null;
+      offset += got;
+      fails = 0;
+      await writeMeta(dir, g.file, { total, size: offset, complete: false });
+      if (whole || got < CHUNK_BYTES || (total && offset >= total)) break;
+    } catch (e) {
+      try { await w?.abort(); } catch {}
+      if (signal.aborted) throw new Error("DOWNLOAD_PAUSED");
+      fails++;
+      const wait = Math.min(30000, 1500 * 2 ** Math.min(fails, 5));
+      onWaiting(offset, total, fails);
+      await waitOrOnline(wait, signal);
+    } finally {
+      clearTimeout(idle);
+      signal.removeEventListener("abort", stop);
+    }
+  }
+  const file = await fh.getFile();
+  await writeMeta(dir, g.file, { total: total || file.size, size: file.size, complete: true });
+  return file;
+}
+
 async function cpuCached(id) {
   const g = GGUF[id];
   if (!g) return false;
-  const list = await cpuCacheList();
+  if (await localModelFile(id)) return true;
+  const list = await cpuCacheList(); // downloads made by the earlier version
   return list.some((e) => (e.metadata?.originalURL || e.name || "").includes(g.file));
 }
 async function cpuDelete(id) {
   const g = GGUF[id];
   if (!g) return;
+  try {
+    const dir = await modelDir();
+    await dir.removeEntry(g.file).catch(() => {});
+    await dir.removeEntry(g.file + ".json").catch(() => {});
+  } catch {}
   await cpuCacheList();
   await wlCache?.cacheManager.deleteMany((e) => (e.metadata?.originalURL || e.name || "").includes(g.file));
 }
@@ -370,37 +482,41 @@ async function ensureEngine(modelId) {
       downloadAbort = null;
     } else {
       const g = GGUF[modelId];
+      const loadParams = { n_ctx: CTX_TOKENS, n_gpu_layers: 0 }; // processor only — never touch the graphics chip
+      let file = await localModelFile(modelId);
+      const inOldCache = !file && (await cpuCacheList()).some((e) => (e.metadata?.originalURL || e.name || "").includes(g.file));
+      if (!file && !inOldCache) {
+        // Make sure there is room on the phone before starting.
+        try {
+          const est = await navigator.storage.estimate();
+          const need = g.mb * 1024 * 1024 - (await partialModelBytes(modelId));
+          if (est.quota && est.quota - est.usage < need * 1.05) throw new Error("NO_SPACE:" + fmtBytes(need));
+        } catch (e) { if (String(e.message).startsWith("NO_SPACE")) throw e; }
+        downloadAbort = new AbortController();
+        const expected = g.mb * 1024 * 1024;
+        const t0 = Date.now();
+        const startBytes = await partialModelBytes(modelId);
+        if (startBytes > 0) showLoader(title, `${sub}Continuing from ${fmtBytes(startBytes)}…`, startBytes / expected);
+        file = await downloadModelFile(modelId, {
+          signal: downloadAbort.signal,
+          onProgress: (loaded, total) => {
+            const t = total || expected;
+            const secs = (Date.now() - t0) / 1000;
+            const speed = secs > 2 ? ` · ${fmtBytes(Math.max(0, loaded - startBytes) / secs)}/s` : "";
+            onProgress({ progress: Math.min(loaded / t, 0.99), text: `${fmtBytes(loaded)} of ${fmtBytes(t)} downloaded${speed}` });
+          },
+          onWaiting: (loaded, total) => {
+            const t = total || expected;
+            showLoader(title, `${sub}Connection lost at ${fmtBytes(loaded)}. Waiting for network… it will continue from here, not start over.`, loaded / t);
+          },
+        });
+        downloadAbort = null;
+      }
+      showLoader(title, sub + "Preparing the model…", 0.99);
       const inst = await newWllama();
       cpuInstance = inst;
-      // Live download info: MB done, speed, and a warning if it stops moving.
-      const expected = g.mb * 1024 * 1024;
-      const dl = { loaded: 0, changed: Date.now(), t0: Date.now() };
-      downloadAbort = new AbortController();
-      const stallTimer = setInterval(() => {
-        if (cached) return;
-        const quiet = (Date.now() - dl.changed) / 1000;
-        if (quiet > 40) showLoader(title, `Download paused at ${fmtBytes(dl.loaded)} of about ${fmtBytes(expected)}. Check your internet — it continues when the connection is back. Or tap Cancel and try again.`, dl.loaded / expected);
-      }, 5000);
-      // Direct file link (not the Hugging Face API) so a saved model also loads with no internet.
-      // Cancel must work at any stage, even before the first byte arrives.
-      const cancelled = new Promise((_, rej) => downloadAbort.signal.addEventListener("abort", () => rej(new Error("DOWNLOAD_CANCELLED"))));
-      cancelled.catch(() => {});
-      await Promise.race([cancelled, inst.loadModelFromUrl(`https://huggingface.co/${g.repo}/resolve/main/${g.file}`, {
-        n_ctx: CTX_TOKENS,
-        n_gpu_layers: 0, // processor only — never touch the graphics chip
-        signal: downloadAbort.signal,
-        progressCallback: ({ loaded, total }) => {
-          const t = total || expected;
-          if (loaded !== dl.loaded) { dl.loaded = loaded; dl.changed = Date.now(); }
-          const secs = (Date.now() - dl.t0) / 1000;
-          const speed = secs > 2 && loaded ? ` · ${fmtBytes(loaded / secs)}/s` : "";
-          onProgress({
-            progress: Math.min(loaded / t, 0.99),
-            text: loaded >= t * 0.99 ? "Almost done, preparing the model…" : `${fmtBytes(loaded)} of ${fmtBytes(t)} downloaded${speed}`,
-          });
-        },
-      })]).finally(() => clearInterval(stallTimer));
-      downloadAbort = null;
+      if (file) await inst.loadModel([file], loadParams);
+      else await inst.loadModelFromUrl(ggufURL(g), loadParams); // saved by the earlier version; loads offline
       engine = makeCpuAdapter(inst);
     }
     engineKind = kind;
@@ -418,6 +534,8 @@ async function ensureEngine(modelId) {
     downloadAbort = null;
     resetEngine(); // a failed load can leave the engine unusable, so always start fresh next time
     setModelState("off");
+    if (String(e?.message) === "DOWNLOAD_PAUSED") throw e;
+    if (String(e?.message).startsWith("NO_SPACE")) throw e;
     if (cancelled) throw new Error("DOWNLOAD_CANCELLED");
     const msg = String(e?.message || e);
     const networkish = /OFFLINE_NOT_CACHED|fetch|network/i.test(msg);
@@ -475,6 +593,8 @@ function explainError(e) {
   if (isGpuLost(e)) return "The AI engine was interrupted. This happens when the phone locks, the app goes to the background, or memory runs low. Tap retry. If it keeps happening, switch to Shark Lite or Shark Nano in Models.";
   if (msg === "GPU_STALLED") return "The graphics chip didn't respond. Switch Settings → AI engine to Processor and try again.";
   if (msg === "DOWNLOAD_CANCELLED") return "Download cancelled. Tap retry to start it again.";
+  if (msg === "DOWNLOAD_PAUSED") return "Download paused. Your progress is saved — tap retry to continue from where it stopped.";
+  if (msg.startsWith("NO_SPACE")) return `Not enough free storage on this device. Shark AI needs about ${msg.split(":")[1]} more. Free up some space (photos, videos, apps) and tap retry.`;
   if (/context size|exceed_context/i.test(msg)) return "This chat got too long for the model's memory. Start a new chat, or shorten your message.";
   if (msg === "NEEDS_GPU") return "This model needs a working graphics chip, which this device doesn't have. Use Shark Nano, Lite, Smart or Coder instead (open Models).";
   if (msg === "NO_WEBGPU") return "This browser can't run Shark AI's chat brain (it needs WebGPU). Use Chrome or Edge on Android/PC, or Safari on iPhone with iOS 26 or newer.";
@@ -1335,19 +1455,21 @@ async function renderModels() {
     const mi = modelInfo.get(m.id) || { vram: 0, f16: false };
     const canRun = kind === "cpu" ? cpuCapable(m.id) : !(mi.f16 && !gpu.f16);
     const cached = canRun ? await modelCached(m.id, kind) : false;
+    const partial = kind === "cpu" && canRun && !cached ? await partialModelBytes(m.id) : 0;
     const isCurrent = engineModel === m.id && engineKind === kind;
     const tooBig = kind === "gpu" && mi.vram > memBudgetMB();
     const badges = [];
     if (m.id === rec) badges.push(el("span", { class: "badge rec" }, "Recommended"));
     if (isCurrent) badges.push(el("span", { class: "badge ok" }, "In use"));
     else if (cached) badges.push(el("span", { class: "badge ok" }, "Offline ready"));
+    else if (partial) badges.push(el("span", { class: "badge warn" }, `Paused · ${fmtBytes(partial)}`));
     if (m.vision) badges.push(el("span", { class: "badge" }, "Sees images"));
     if (tooBig) badges.push(el("span", { class: "badge warn" }, "May be too big"));
     const actions = el("div", { class: "actions" });
     if (!canRun) actions.append(el("span", { class: "muted small" }, kind === "cpu" ? "Needs a graphics chip" : "Not supported on this device"));
     else if (isCurrent) actions.append(el("button", { class: "btn btn-ghost btn-sm", disabled: true }, "Active"));
-    else actions.append(el("button", { class: "btn btn-primary btn-sm", onclick: () => useModel(m.id) }, cached ? "Use" : "Download"));
-    if (cached && !isCurrent) {
+    else actions.append(el("button", { class: "btn btn-primary btn-sm", onclick: () => useModel(m.id) }, cached ? "Use" : partial ? "Continue" : "Download"));
+    if ((cached || partial) && !isCurrent) {
       actions.append(el("button", { class: "btn btn-ghost btn-sm", onclick: async () => {
         if (!confirm(`Delete ${m.name} from this device? You'll need internet to download it again.`)) return;
         if (kind === "cpu") await cpuDelete(m.id).catch(() => {});
@@ -1771,7 +1893,7 @@ async function init() {
   $("#welcomeDlg").addEventListener("cancel", (e) => { e.preventDefault(); });
   $("#loaderHide").addEventListener("click", () => { loaderHidden = true; $("#loader").classList.add("hidden"); });
   $("#loaderCancel").addEventListener("click", () => {
-    if (downloadAbort) { downloadAbort.abort(); toast("Download cancelled."); }
+    if (downloadAbort) { downloadAbort.abort(); toast("Download paused. Progress saved."); }
     else { loaderHidden = true; $("#loader").classList.add("hidden"); }
   });
   document.querySelectorAll("dialog [data-close]").forEach((b) => b.addEventListener("click", () => b.closest("dialog").close()));
