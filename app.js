@@ -144,6 +144,7 @@ const activeChat = () => chats.find((c) => c.id === activeId) || null;
 const device = {
   mobile: /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) || navigator.userAgentData?.mobile === true,
   ios: /iPhone|iPad|iPod/i.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1),
+  android: /Android/i.test(navigator.userAgent),
   mem: navigator.deviceMemory || null,
   gpu: null, // filled by detectGPU
 };
@@ -260,8 +261,9 @@ async function engineKindFor() {
   const gpu = await detectGPU();
   if (!gpu.ok) return "cpu";
   if (settings.engine === "gpu") return "gpu";
-  // Known problem: WebLLM crashes on Qualcomm Adreno phone GPUs, so those phones start on the processor.
-  if (device.mobile && /qualcomm|adreno/i.test(gpu.vendor || "")) return "cpu";
+  // Android phone graphics chips (Adreno, Mali…) often crash or freeze with WebLLM,
+  // so Android uses the processor engine unless the user picks "Graphics chip" in Settings.
+  if (device.android) return "cpu";
   return gpuMarkedBroken() ? "cpu" : "gpu";
 }
 
@@ -341,13 +343,31 @@ async function ensureEngine(modelId) {
     if (engine && (engineKind !== kind || kind === "cpu")) resetEngine();
     if (kind === "gpu") {
       const w = await getWebLLM();
-      if (!engine) {
-        engineWorker = new Worker(new URL("./llm-worker.js", import.meta.url), { type: "module" });
-        engine = await w.CreateWebWorkerMLCEngine(engineWorker, modelId, { initProgressCallback: onProgress });
-      } else {
-        engine.setInitProgressCallback?.(onProgress);
-        await engine.reload(modelId);
-      }
+      downloadAbort = new AbortController();
+      const cancelled = new Promise((_, rej) => downloadAbort.signal.addEventListener("abort", () => rej(new Error("DOWNLOAD_CANCELLED"))));
+      cancelled.catch(() => {});
+      // Watchdog: if the graphics-chip engine never starts (no progress at all for 60s),
+      // treat the graphics chip as broken so we fall back to the processor engine.
+      let started = false;
+      const t0 = Date.now();
+      let watch;
+      const stalled = new Promise((_, rej) => {
+        watch = setInterval(() => { if (!started && Date.now() - t0 > 60000) rej(new Error("GPU_STALLED")); }, 3000);
+      });
+      stalled.catch(() => {});
+      const gpuProgress = (r) => { if ((r.progress || 0) > 0 || /fetch|load|cache/i.test(r.text || "")) started = true; onProgress(r); };
+      const load = (async () => {
+        if (!engine) {
+          engineWorker = new Worker(new URL("./llm-worker.js", import.meta.url), { type: "module" });
+          engine = await w.CreateWebWorkerMLCEngine(engineWorker, modelId, { initProgressCallback: gpuProgress });
+        } else {
+          engine.setInitProgressCallback?.(gpuProgress);
+          await engine.reload(modelId);
+        }
+      })();
+      load.catch(() => {});
+      await Promise.race([cancelled, stalled, load]).finally(() => clearInterval(watch));
+      downloadAbort = null;
     } else {
       const g = GGUF[modelId];
       const inst = await newWllama();
@@ -453,6 +473,7 @@ function resetEngine() {
 function explainError(e) {
   const msg = String(e?.message || e);
   if (isGpuLost(e)) return "The AI engine was interrupted. This happens when the phone locks, the app goes to the background, or memory runs low. Tap retry. If it keeps happening, switch to Shark Lite or Shark Nano in Models.";
+  if (msg === "GPU_STALLED") return "The graphics chip didn't respond. Switch Settings → AI engine to Processor and try again.";
   if (msg === "DOWNLOAD_CANCELLED") return "Download cancelled. Tap retry to start it again.";
   if (/context size|exceed_context/i.test(msg)) return "This chat got too long for the model's memory. Start a new chat, or shorten your message.";
   if (msg === "NEEDS_GPU") return "This model needs a working graphics chip, which this device doesn't have. Use Shark Nano, Lite, Smart or Coder instead (open Models).";
